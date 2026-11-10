@@ -4,7 +4,7 @@ paths:
   data_root: data_demo
 food101:
   source: parquet
-  parquet_files: ["/Users/sharviendait/.cache/huggingface/hub/datasets--ethz--food101/snapshots/83488de741c1bd1ce27aa6a2b33e19c7bdf92ca9/data/validation-00000-of-00003.parquet"]
+  parquet_files: []   # set to your local copy of data/validation-00000-of-00003.parquet (HF ethz/food101)
 crops:
   detector_model: IDEA-Research/grounding-dino-tiny
   segmenter_model: facebook/sam2.1-hiera-small

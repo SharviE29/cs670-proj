@@ -1,166 +1,239 @@
-# Smoke tests: does background context leak into a VLM's answers?
+# CIRA: a controlled, pixel-preserving food-scene dataset (CS670)
 
-Three small scripts to check, in about an afternoon, whether the project's core
-effect exists before you commit to training anything.
+Vision–language models let the **background leak into object answers**: a taco on a Tokyo
+street gets called sushi. This project measures and trains **selective dependence**: an
+answer should change only when the entity the question asks about changes.
 
-| Script | Question it answers | Needs GPU |
-|---|---|---|
-| `make_pairs.py` | Builds the same food plate on different backgrounds (plus masks) | No |
-| `run_eval.py` | Does the background change the **dish** answer (bad) and the **context** answer (good)? | Yes (or `--dry_run`) |
-| `attention_share.py` | Does the model look at the plate more for dish questions than for context questions? | Yes |
+This repository contains:
 
-The pipeline was tested end to end with fake images and `--dry_run`. It has
-**not** been run with a real model yet, so expect small fixes on first run
-(e.g. transformers version differences).
+1. **`data_pipeline/`**: builds the dataset (the main deliverable). Every image is composited
+   from layers: **background + left plate + right plate**, at fixed slots. An edit swaps exactly
+   one layer, and every pixel outside that layer's region is byte-identical. No generative model
+   ever touches a pixel.
+2. **Pilot smoke test** (`make_pairs.py`, `run_eval.py`, `attention_share.py`): the original
+   425-pair experiment that checked whether the background effect exists at all. Kept for
+   reference; see [Pilot smoke test](#pilot-smoke-test-original-experiment) at the end.
 
 ---
 
-## 0. Setup
+## What the dataset looks like
 
-```bash
-pip install -r requirements.txt
-```
+A **group** is one base scene plus six edits, **7 images**:
 
-GPU memory: Qwen2.5-VL-**3B** needs about 8–10 GB in bf16, **7B** about 17–20 GB.
-Start with 3B (the default); switch with `--model Qwen/Qwen2.5-VL-7B-Instruct`.
-If you have no GPU yet, everything except the model calls runs on a laptop
-(`--dry_run`), and the free Colab T4 (16 GB) can run the 3B model.
+| key | left dish | right dish | background |
+|-----|-----------|------------|------------|
+| x   | t  | o  | s  |
+| t   | t′ | o  | s  |
+| o   | t  | o′ | s  |
+| b   | t  | o  | s′ |
+| to  | t′ | o′ | s  |
+| tb  | t′ | o  | s′ |
+| ob  | t  | o′ | s′ |
 
-## 1. Collect backgrounds
+Each image gets three 4-option multiple-choice questions:
 
-**Automatic (recommended):** download freely licensed landmark photos from
-Wikimedia Commons (3 landmarks per country, 2 photos each):
+- `q_L`: *What dish is on the left plate?*
+- `q_R`: *What dish is on the right plate?*
+- `q_S`: *In which country/region was this photo taken?*
 
-```bash
-python fetch_backgrounds.py                                   # all 10 countries
-python fetch_backgrounds.py --countries japan italy france mexico india   # just 5
-```
+That gives 21 labelled cells per group. Within a group, all 7 images share the same options in
+the same order. Correct answers come mechanically from the recipe (what is actually in the
+slot). Every cell also has a relevance label (`change` / `keep`): whether the answer *should*
+change relative to the base image `x`.
 
-Then open `backgrounds/preview.jpg` and **delete anything that isn't a clear,
-outdoor, recognisable scene** (maps, interiors, close-ups, crowds of faces, food).
-Search results are usually good but never perfect. `backgrounds/credits.csv`
-lists the author and license of every image: cite it in your report and poster.
-
-**Manual alternative:** make one folder per country and put 3–5 photos in each:
-
-```
-backgrounds/
-  japan/     (e.g. Kyoto temple, Tokyo street, Mount Fuji)
-  italy/     (Colosseum, Venice canal, Florence street)
-  france/    (Eiffel Tower, Paris café street)
-  mexico/    (Chichén Itzá, Mexico City square)
-  india/     (Taj Mahal, Jaipur palace)
-  china/     (Great Wall, Forbidden City)
-  korea/     (Gyeongbokgung palace, Seoul street)
-  thailand/  (Bangkok temple)
-  vietnam/   (Hạ Long Bay, Hoi An lanterns)
-  spain/     (Sagrada Família, Seville plaza)
-```
-
-Wikimedia Commons is a good source (check each image's license). You only need
-a few countries for the smoke test; 4–5 is enough. Prefer photos where the
-landmark or setting is clearly recognizable, since that's the "context" signal.
-
-## 2. Build the image pairs
-
-```bash
-python make_pairs.py --from_hf --bg_dir backgrounds --out pairs --n_per_dish 5
-```
-
-This streams Food-101 from Hugging Face (no full 5 GB download) and keeps
-5 photos for each of the 17 dishes in `common.py`. With 5 countries that gives
-17 × 5 × 5 = 425 paired records.
-
-Open a few files in `pairs/img/` and check that they look reasonable. The default
-cut-out is an ellipse (Food-101 photos are mostly centred on the plate). For a
-cleaner cut-out, add `--use_rembg` (needs `pip install rembg`).
-
-`--plate_frac` controls how big the plate is (default 0.45 of image width).
-Smaller plates make the background more dominant, so the test is harder.
-
-## 3. Run the main smoke test
-
-```bash
-python run_eval.py --pairs pairs/meta.jsonl --out results.csv
-```
-
-Each record is asked 5 questions (3 dish, 2 context), so 425 records means
-about 2,100 forward passes: roughly 10–20 minutes for the 3B model on one GPU.
-Use `--limit 50` for a 2-minute first check.
-
-**How the test is designed (paired):** for each record, the dish question is
-asked with the *same* options in the *same* order on the cultural composite, the
-neutral composite and the original photo. One wrong option is always a dish from
-the **background's** country (the "leak" option). So any change in the answer is
-caused by the background alone.
-
-The summary is printed and saved to `results_summary.txt`.
-
-## 4. How to read the results
-
-| Metric | Want for a good model | What it means if it fails |
+| Split | Groups | Contents |
 |---|---|---|
-| Accuracy: original vs neutral | about equal | If neutral is much lower, the pasting itself confuses the model. Fix the cut-out (try `--use_rembg`) before going further. |
-| Accuracy: neutral vs **mismatched** bg | equal | A drop means the background hurts dish recognition. **This is the effect you're studying.** |
-| **Invariance** | close to 100% | % of mismatched cases where the dish answer is unchanged by the background |
-| **Leakage**, cultural vs neutral | equal | If it goes up, the model is pulled toward the *background's* cuisine (e.g. "pizza" in front of the Colosseum) |
-| **Sensitivity**: bg-only vs bg+food | both high | The model should still recognise the setting when food is added |
-| Reverse leakage | equal | Does the food pull the *country* answer toward the food's country? |
+| train | 3,000 | 40 seen classes |
+| val | 300 | seen classes |
+| test_id | 1,000 | seen classes, new photos and backgrounds |
+| test_unseen | 400 | only the 10 held-out classes |
 
-Every number has a ± 95% confidence interval. If the interval is wider than the
-effect, add more items (`--n_per_dish 10`).
+No food photo and no background image appears in more than one split. Some (class, region),
+dish-swap and region-swap combinations are withheld from train for composition tests.
 
-## 5. Decision rules: what to do next
+Sources:
 
-1. **Clear background effect** (accuracy drop or leakage increase of at least ~5
-   points, outside the error bars): the project's premise holds. Go to step 6.
-2. **Small effect** with Qwen2.5-VL-3B:
-   - shrink the plate: `--plate_frac 0.25`
-   - try a weaker/older model and a stronger one, to see whether the effect
-     shrinks with scale (that trend is itself worth reporting);
-   - use CultureMix's own images if they're released (they report a 14% drop).
-3. **Neutral is much worse than original**: your images look fake to the model.
-   Fix the compositing before interpreting anything else.
-4. **Still no effect anywhere**: the honest result is "modern VLMs are robust to
-   this". That's a valid finding, but you'd then want to pivot the project's
-   emphasis to the mechanistic analysis (why they're robust).
+- **Food:** cutouts from the Food-101 **test** split (GroundingDINO → SAM2 → filters).
+- **Backgrounds:** about 1,200 Wikimedia Commons scenes across 16 regions, with per-image
+  licenses.
+- **Rendering:** 448 × 448 PNG.
 
-## 6. Attention smoke test (mechanistic first look)
+---
+
+## How to read this project
+
+Start with these, in order:
+
+| File | What it tells you |
+|---|---|
+| [data_pipeline/config.yaml](data_pipeline/config.yaml) | Every constant: paths, model choices, thresholds, slot positions, split sizes. Items marked `OPEN ITEM` still need a decision. |
+| [data_pipeline/classes.py](data_pipeline/classes.py) | The 50 food classes, class → region map, and the 10 held-out classes. Contested mappings are marked `# CHECK:`. |
+| [data_pipeline/render.py](data_pipeline/render.py) | The compositor and why it preserves pixels. Read the module docstring. |
+| [data_pipeline/groups.py](data_pipeline/groups.py) + [questions.py](data_pipeline/questions.py) | How a group and its 21 question cells are built. |
+| [data_pipeline/audit.py](data_pipeline/audit.py) | The checks that must pass before release. |
+| [tests/](tests/) | Executable spec: pixel preservation, labels, splits, end to end. |
+
+Pipeline modules, one per step:
+
+```
+data_pipeline/
+  config.yaml          all constants (config.demo.yaml: small-model laptop variant)
+  utils.py             config loading, seeds, JSONL I/O, hashing
+  classes.py           Step 1  class list and class -> region mapping
+  crops.py             Step 2  Food-101 cutouts: detect, segment, filter, CLIP and Qwen checks
+  backgrounds.py       Step 3  Wikimedia download, license filter, CLIP audit
+  render.py            Step 4  deterministic layer compositor
+  groups.py            Step 5  7-image group recipes
+  questions.py         Step 6  multiple-choice questions, 21 cells per group
+  splits.py            Step 7  split assignment, near-duplicate check, leakage asserts
+  audit.py             Step 8  automated checks, control sets, human-audit sheet
+  freeze.py            Step 9  manifests, SHA-256, stats, datasheet
+  slurm/build.sbatch   Unity (Slurm) job script
+notebooks/
+  cira_build_dataset_colab.ipynb   the whole build on Google Colab
+tests/                 pytest suite (synthetic data by default, full dataset on demand)
+```
+
+### Guarantees and where they are enforced
+
+| Guarantee | How |
+|---|---|
+| An edit changes only the swapped layer's pixels | Plates never leave their hard mask (the feather ramps *inward*) and the mask never leaves its slot box. `audit.check_group_pixels` checks **every pair** of images in **every** group. |
+| A background swap never changes an opaque plate pixel | Same check. |
+| Edits commute | `to` reached via t-then-o is byte-identical to o-then-t and to a fresh render (`audit.check_commutativity`). |
+| Deterministic output | Same inputs give identical bytes. Saved PNGs are compared with re-renders. |
+| Labels are mechanical | Answer = slot content; options identical across the 7 images; relevance matches the spec table (`audit.check_labels`). |
+| No split leakage | `splits.verify` asserts disjoint photos and backgrounds, held-out classes only in test_unseen, withheld pairings absent from train, and no near-duplicates (pHash) across splits. |
+| A frozen release can't change silently | `freeze.py` refuses changed content without a `version` bump. |
+
+The test suite includes tests that inject a leaked pixel, a cross-split photo or a corrupted
+label, and assert the checks catch it. A passing run therefore means the checks were able to
+fail and did not.
+
+---
+
+## Quick start (laptop, no GPU)
 
 ```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python -m data_pipeline.classes      # print and validate the class/region table
+pytest -q                            # whole pipeline on a synthetic dataset, about 1 minute
+```
+
+`pytest` builds a tiny synthetic dataset (fake plates and backgrounds), then runs splits,
+groups, questions, rendering, every audit check, controls, the human-audit export and the
+freeze. Run it first after any code change.
+
+---
+
+## Building the real dataset
+
+You need a GPU for Steps 2, 3 (audit) and 8, plus internet for the Food-101 and Wikimedia
+downloads. There are three ways to run it.
+
+### Option A: Google Colab (easiest)
+
+Open [notebooks/cira_build_dataset_colab.ipynb](notebooks/cira_build_dataset_colab.ipynb) in
+Colab and choose *Runtime → Change runtime type → GPU*, then run the cells top to bottom.
+
+- The notebook clones this repo. For a private repo, add a `GH_TOKEN` Colab secret.
+- It installs the pinned dependencies and downloads Food-101.
+- It saves a checkpoint to Google Drive after every step.
+- Cutout extraction resumes after a disconnect.
+
+### Option B: UMass Unity (Slurm)
+
+```bash
+# once, on a login node (internet):
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+export CIRA_DATA_ROOT=/work/pi_<you>/cira HF_HOME=$CIRA_DATA_ROOT/hf
+wget -P $CIRA_DATA_ROOT http://data.vision.ee.ethz.ch/cvl/food-101.tar.gz && tar -xzf $CIRA_DATA_ROOT/food-101.tar.gz -C $CIRA_DATA_ROOT
+python -c "from huggingface_hub import snapshot_download as s; [s(m) for m in ['IDEA-Research/grounding-dino-base','facebook/sam2.1-hiera-large','openai/clip-vit-large-patch14','Qwen/Qwen2.5-VL-3B-Instruct']]"
+python -m data_pipeline.backgrounds fetch            # Wikimedia download (internet)
+
+# GPU jobs (run offline):
+sbatch --export=ALL,STEP=crops   data_pipeline/slurm/build.sbatch
+sbatch --export=ALL,STEP=qwen    data_pipeline/slurm/build.sbatch
+sbatch --export=ALL,STEP=bgaudit data_pipeline/slurm/build.sbatch
+```
+
+Then continue with the CPU steps below, using `sbatch --array=0-15 ... STEP=render` for
+rendering. Edit the partition and account names in `build.sbatch` first.
+
+### Option C: any GPU machine, step by step
+
+Set `CIRA_DATA_ROOT` (default `./data`) and put Food-101 at `$CIRA_DATA_ROOT/food-101`.
+To use a different config file, set `CIRA_CONFIG=path/to/override.yaml`. An override file
+can start with `_base: config.yaml` and list only the keys it changes.
+
+| # | Command | Output | What to look at |
+|---|---|---|---|
+| 2 | `python -m data_pipeline.crops extract` | `crops/<class>/<id>.png` (RGBA) + `_mask.png`, `rejections.jsonl` | Resumable; `--fresh` restarts |
+| 2 | `python -m data_pipeline.crops qwen-check` | `crops/qwen_class_check.json` | Logged selection-bias exception |
+| 2 | `python -m data_pipeline.crops finalize` | `crops/index.jsonl`, `class_status.json` | Dropped classes and why |
+| 2 | `python -m data_pipeline.crops report` | Rejection table, `crops/contact_sheet.jpg` | **Review before continuing** |
+| 3 | `python -m data_pipeline.backgrounds fetch` | `backgrounds/img/`, `licenses.csv` | Needs internet |
+| 3 | `python -m data_pipeline.backgrounds audit` | `backgrounds/index.jsonl` | CLIP region and scene check |
+| 3 | `python -m data_pipeline.backgrounds report` | `backgrounds/contact_sheet.jpg` | **Review before continuing** |
+| 7 | `python -m data_pipeline.splits assign` | `splits/assignment.json`, `heldout_pairings.json` | Split ownership is fixed before groups |
+| 5 | `python -m data_pipeline.groups` | `groups/<split>.jsonl` (recipes, IDs only) | |
+| 6 | `python -m data_pipeline.questions` | `questions/<split>.jsonl` (21 cells per group) | `--show g000000` prints one group |
+| 7 | `python -m data_pipeline.splits verify` | Assertions | Must pass |
+| 4 | `python -m data_pipeline.render --demo group.png` | 7 images side by side | Check slot sizes |
+| 4 | `python -m data_pipeline.render --split train` (and val, test_id, test_unseen) | `renders/<split>/<group>/<key>.png` | `--shard i --num_shards n` to parallelise |
+| 8 | `python -m data_pipeline.audit controls` | Control recipes, cells and images | Identity re-paste, wrong-entity, harmonized, blank |
+| 8 | `python -m data_pipeline.audit checks --use_saved` | `audit/checks.json` | **Must PASS** (full dataset) |
+| 8 | `CIRA_TEST_FULL=1 pytest -q tests` | | Same tests over every real group |
+| 8 | `python -m data_pipeline.audit human-export` | `audit/human_audit.html` | Open, mark, download CSV |
+| 8 | `python -m data_pipeline.audit human-ingest results.csv` | `audit/human_audit_stats.json` | |
+| 9 | `python -m data_pipeline.freeze` | `release/` (`FREEZE.json`, `STATS.md`, `DATASHEET.md`, manifests) | Needs `benchmark_name`, passing checks, git commit |
+
+Splits are assigned before groups are sampled. That is why Step 7's `assign` runs before
+Steps 5–6.
+
+### Using the finished dataset
+
+- **Images:** `renders/<split>/<group_id>/<key>.png`. They can also be re-rendered from
+  `groups/<split>.jsonl` with `render.Renderer` + `render.render_group`.
+- **Questions:** `questions/<split>.jsonl`, one line per (image, question) cell. Fields include
+  `image`, `prompt`, `options`, `answer`, `answer_letter` and `relevance` (`base` / `keep` /
+  `change`), plus `perm`. To run the 4 cyclic option orders, use
+  `questions.displayed_options(canonical, perm, shift)` for shift = 0..3.
+- **Controls:** `questions/controls.jsonl`, with a `control` field set to `identity_repaste`,
+  `wrong_entity_swap`, `harmonized` or `blank`.
+- **Integrity:** `release/FREEZE.json` lists the SHA-256 of every file. Cite the backgrounds
+  using `backgrounds_licenses.csv`.
+
+---
+
+## Open decisions (before freezing)
+
+- Final 50 classes and the class → region mapping (`classes.py`, `# CHECK:` lines).
+- Slot positions and footprint (`render.slots`). Proposed: 180 px boxes at the bottom left and
+  right, with a 3 px feather.
+- Wikimedia categories per region (`backgrounds.categories`).
+- Benchmark name (`benchmark_name`; `freeze.py` refuses to run while it is null).
+
+---
+
+## Pilot smoke test (original experiment)
+
+| Script | Question it answers |
+|---|---|
+| `fetch_backgrounds.py` | Downloads about 30 landmark backgrounds and their credits (`backgrounds/credits.csv`) |
+| `make_pairs.py` | Pastes one plate (ellipse cutout) on different backgrounds → `pairs/` |
+| `run_eval.py` | Does the background change the dish answer (bad) or the context answer (good)? Uses Qwen2.5-VL, `--dry_run` without a GPU |
+| `attention_share.py` | Per-layer attention to the plate for dish vs context questions |
+
+```bash
+python fetch_backgrounds.py
+python make_pairs.py --from_hf --bg_dir backgrounds --out pairs --n_per_dish 5
+python run_eval.py --pairs pairs/meta.jsonl --out results.csv
 python attention_share.py --pairs pairs/meta.jsonl --n 30 --out attn
 ```
 
-Produces `attn.png`: for each LLM layer, the share of the answer token's
-attention to the image that lands on the **plate**, for dish questions vs
-context questions. The dashed line is the plate's share of the image area.
-
-- Dish line **above** context line in middle–late layers: the model already
-  routes attention by question to some degree.
-- Lines **on top of each other**: attention doesn't depend on the question, which
-  is a good motivation for a question-conditioned method.
-
-Attention is only a rough proxy. Causal tests (attention knockout, activation
-patching of background tokens) are the next step, once the effect is confirmed.
-
-## 7. After the smoke test (not included yet)
-
-1. **Baselines:** prompt-only ("focus on the food"); ordinary LoRA fine-tuning on
-   mixed backgrounds (the CultureMix-style approach).
-2. **Invariance + sensitivity training:** LoRA with an added KL term between the
-   dish-answer distributions for the same food on two backgrounds, with every
-   batch containing both question types.
-3. **Held-out split:** train and test on *different food photos and different
-   background photos*, never just new backgrounds for the same food photo.
-4. **Causal analysis:** block or patch background tokens and measure how much the
-   dish answer moves before vs after training.
-
-## Files
-
-```
-fetch_backgrounds.py  download landmark backgrounds + credits from Wikimedia Commons
-common.py           dish -> country map, label helpers
-make_pairs.py       build composites, masks, metadata (pairs/meta.jsonl)
-run_eval.py         paired multiple-choice evaluation + metrics (+ --dry_run)
-attention_share.py  per-layer attention to plate vs background
-```
+The dataset pipeline reuses the pilot's centre-crop resizing and its "same options, same
+order across compared images" design. It replaces the ellipse cutout with real segmentation,
+the single plate with two independently editable slots, and the per-record options with one
+option set per group.

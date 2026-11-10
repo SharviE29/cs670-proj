@@ -293,6 +293,22 @@ def build_controls(cfg: Config, renderer: Renderer, groups: dict[str, list[dict]
 
 
 # ---------------------------------------------------------------- human audit
+def thumb_data_uri(path: str, size: int = 256) -> str:
+    """Self-contained thumbnail (the HTML must work after downloading it from Colab/Unity)."""
+    import base64
+    import io
+
+    im = Image.open(path)
+    if im.mode == "RGBA":  # cutouts: show on mid-gray like the class check
+        bg = Image.new("RGBA", im.size, (128, 128, 128, 255))
+        im = Image.alpha_composite(bg, im)
+    im = im.convert("RGB")
+    im.thumbnail((size, size))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
 def human_export(cfg: Config, log=None) -> Path:
     log = log or get_logger("audit", cfg)
     hc = cfg["human_audit"]
@@ -324,7 +340,7 @@ def human_export(cfg: Config, log=None) -> Path:
             w.writerow({**it, "pass": "", "rater": "", "note": ""})
     rows = "\n".join(
         f'<tr data-id="{html.escape(it["item_id"])}" data-kind="{it["kind"]}"><td>'
-        f'<img src="file://{html.escape(it["src"])}" loading="lazy"></td><td>{html.escape(it["kind"])}<br>'
+        f'<img src="{thumb_data_uri(it["src"])}"></td><td>{html.escape(it["kind"])}<br>'
         f'<b>{html.escape(it["label"])}</b><br><small>{html.escape(it["item_id"])}</small></td>'
         f'<td>{html.escape(it["question"])}<br><label><input type="radio" name="{i}" value="1"> yes</label> '
         f'<label><input type="radio" name="{i}" value="0"> no</label><br>'

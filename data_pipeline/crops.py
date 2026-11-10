@@ -34,7 +34,7 @@ from PIL import Image, ImageDraw
 from scipy.ndimage import label as cc_label
 
 from .classes import CLASSES, pretty
-from .utils import (Config, RejectionLog, derive_seed, get_logger, load_config, pick_device,
+from .utils import (Config, derive_seed, get_logger, load_config, pick_device,
                     read_jsonl, seed_everything, write_json, write_jsonl)
 
 
@@ -198,7 +198,10 @@ def on_gray(rgba: Image.Image, size: int, gray: int, fit: int | None = None) -> 
 
 
 # ---------------------------------------------------------------- extract
-def extract(cfg: Config, classes: list[str], limit: int | None = None) -> dict:
+def extract(cfg: Config, classes: list[str], limit: int | None = None, fresh: bool = False) -> dict:
+    """Resumable: every processed photo is appended to crops/_progress.jsonl immediately, so a
+    crashed / disconnected run continues where it stopped (pass fresh=True to start over).
+    index_raw.jsonl and rejections.jsonl are rebuilt from the progress log at the end."""
     log = get_logger("crops", cfg)
     cc = cfg["crops"]
     seed = derive_seed(cfg["seed"], "crops")
@@ -206,15 +209,30 @@ def extract(cfg: Config, classes: list[str], limit: int | None = None) -> dict:
     device = pick_device(cc["device"])
     log.info("device=%s detector=%s segmenter=%s clip=%s", device, cc["detector_model"],
              cc["segmenter_model"], cc["class_check"]["model"])
+    out_dir = cfg.path("crops_dir")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prog_path = out_dir / "_progress.jsonl"
+    if fresh and prog_path.exists():
+        prog_path.unlink()
+    done = {r["id"]: r for r in read_jsonl(prog_path)} if prog_path.exists() else {}
+    accepted = Counter(r["row"]["class"] for r in done.values() if "row" in r)
+    if done:
+        log.info("resuming: %d photos already processed, %d accepted", len(done), sum(accepted.values()))
     seg = Segmenter(cfg, device)
     ccheck = cc["class_check"]
     clip = ClipClassifier(ccheck["model"], CLASSES, ccheck["prompt"], device)
-    out_dir = cfg.path("crops_dir")
-    rej = RejectionLog(cfg.path("crops_rejections"))
-    rows, accepted, tried = [], Counter(), Counter()
+    prog = open(prog_path, "a")
+
+    def rej(iid, reason, **details):
+        prog.write(json.dumps({"id": iid, "reason": reason, **details}, sort_keys=True) + "\n")
+        prog.flush()
+
+    tried = Counter()
     lo, hi = cc["mask_area_frac"]
     for cls, iid, img in iter_food101(cfg, classes, seed, limit or cc["max_photos_per_class"]):
         tried[cls] += 1
+        if iid in done:
+            continue
         if accepted[cls] >= cc["target_max_per_class"]:
             rej(iid, "class_full")
             continue
@@ -242,19 +260,35 @@ def extract(cfg: Config, classes: list[str], limit: int | None = None) -> dict:
         rgba.save(out_dir / rel)
         Image.fromarray((dom * 255).astype(np.uint8)).save(out_dir / f"{iid}_mask.png")
         accepted[cls] += 1
-        rows.append({
+        row = {
             "crop_id": iid, "class": cls, "source_id": iid,
             "source": "food101-test" if cfg["food101"]["source"] == "local" else "food101-test(hf-index)",
             "rgba_path": str(rel), "mask_path": f"{iid}_mask.png",
             "det_box": [round(v, 1) for v in box], "det_score": round(dscore, 4), "sam_iou": round(siou, 4),
             "mask_area_frac": round(area, 4), "dominant_cc_frac": round(frac, 4),
             "clip_p_true": round(float(p.max()), 4), "cutout_size": list(rgba.size),
-        })
-    rej.close()
+        }
+        prog.write(json.dumps({"id": iid, "row": row}, sort_keys=True) + "\n")
+        prog.flush()
+        if sum(tried.values()) % 50 == 0:
+            log.info("processed %d photos this run; accepted so far %s", sum(tried.values()), dict(accepted))
+    prog.close()
+    return rebuild_extract_outputs(cfg, seed)
+
+
+def rebuild_extract_outputs(cfg: Config, seed: int | None = None) -> dict:
+    """index_raw.jsonl, rejections.jsonl and extract_stats.json from crops/_progress.jsonl."""
+    log = get_logger("crops", cfg)
+    out_dir = cfg.path("crops_dir")
+    recs = list({r["id"]: r for r in read_jsonl(out_dir / "_progress.jsonl")}.values())
+    rows = sorted((r["row"] for r in recs if "row" in r), key=lambda r: r["crop_id"])
+    rejs = sorted((r for r in recs if "reason" in r), key=lambda r: r["id"])
     write_jsonl(out_dir / "index_raw.jsonl", rows)
-    stats = {"tried": dict(tried), "accepted": dict(accepted), "rejections": rej.counts, "seed": seed}
+    write_jsonl(cfg.path("crops_rejections"), rejs)
+    stats = {"processed": len(recs), "accepted": dict(Counter(r["class"] for r in rows)),
+             "rejections": dict(Counter(r["reason"] for r in rejs)), "seed": seed}
     write_json(out_dir / "extract_stats.json", stats)
-    log.info("accepted %d / tried %d; rejections %s", sum(accepted.values()), sum(tried.values()), rej.counts)
+    log.info("accepted %d / processed %d; rejections %s", len(rows), len(recs), stats["rejections"])
     return stats
 
 
@@ -271,7 +305,7 @@ def qwen_check(cfg: Config) -> dict:
     seed = derive_seed(cfg["seed"], "qwen_check", qc["seed_offset"])
     rows = read_jsonl(cfg.path("crops_dir") / "index_raw.jsonl")
     device = pick_device(cfg["crops"]["device"])
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(qc["model"], torch_dtype=torch.bfloat16).to(device).eval()
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(qc["model"], dtype=getattr(torch, qc["dtype"])).to(device).eval()
     proc = AutoProcessor.from_pretrained(qc["model"], max_pixels=qc["max_pixels"])
     letters = cfg["questions"]["letters"][: qc["n_options"]]
     letter_ids = [proc.tokenizer.encode(l, add_special_tokens=False)[0] for l in letters]
@@ -382,13 +416,14 @@ def main():
     ap.add_argument("--classes", nargs="*", help="subset of classes (default: all 50)")
     ap.add_argument("--limit_per_class", type=int)
     ap.add_argument("--no_qwen", action="store_true", help="finalize without the Qwen check (dev only)")
+    ap.add_argument("--fresh", action="store_true", help="extract: ignore crops/_progress.jsonl and start over")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if args.cmd == "extract":
         classes = args.classes or CLASSES
         unknown = set(classes) - set(CLASSES)
         assert not unknown, f"unknown classes {unknown}"
-        extract(cfg, classes, args.limit_per_class)
+        extract(cfg, classes, args.limit_per_class, fresh=args.fresh)
     elif args.cmd == "qwen-check":
         qwen_check(cfg)
     elif args.cmd == "finalize":

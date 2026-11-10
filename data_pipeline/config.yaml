@@ -63,6 +63,7 @@ crops:
     min_class_accuracy: 0.80
     n_options: 4
     max_pixels: 401408          # 512*28*28
+    dtype: bfloat16             # use float16 on a Colab T4 (no fast bf16)
     seed_offset: 17
   device: auto                  # auto | cuda | mps | cpu
   batch_size: 8
