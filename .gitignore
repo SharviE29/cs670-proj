@@ -1,0 +1,16 @@
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# generated data (rebuilt by the pipeline; release artifacts are hashed in FREEZE.json)
+data/
+data_demo/
+logs/
+pairs/img/
+colab/
+
+# pilot background images (credits.csv is kept; re-download with fetch_backgrounds.py)
+backgrounds/*/
+backgrounds/preview.jpg

@@ -1,0 +1,165 @@
+# CIRA dataset-generation config. Every constant used by data_pipeline/ lives here.
+# Items marked "OPEN ITEM" are proposals awaiting sign-off (see spec "Open items").
+# Any change after freezing requires bumping `version`.
+
+version: "0.1.0-dev"
+benchmark_name: null            # OPEN ITEM: freeze.py refuses to run while this is null
+seed: 670                       # master seed; each step derives its own seed from it + step name
+
+paths:
+  # All relative paths resolve against `data_root`. `data_root` itself resolves against the
+  # repo root unless absolute. Override on Unity with:  export CIRA_DATA_ROOT=/work/pi_xxx/cira
+  data_root: data
+  food101_root: food-101        # official tarball layout: images/<class>/<id>.jpg, meta/test.txt
+  hf_cache: null                # null -> default HF cache; set to a scratch dir on Unity
+  crops_dir: crops              # crops/<class>/<id>.png (RGBA) + crops/<class>/<id>_mask.png
+  crops_index: crops/index.jsonl
+  crops_rejections: crops/rejections.jsonl
+  crops_qwen_check: crops/qwen_class_check.json
+  backgrounds_dir: backgrounds
+  backgrounds_index: backgrounds/index.jsonl
+  backgrounds_licenses: backgrounds/licenses.csv
+  backgrounds_rejections: backgrounds/rejections.jsonl
+  groups_dir: groups            # groups/<split>.jsonl (recipes) + groups/controls.jsonl
+  questions_dir: questions      # questions/<split>.jsonl (21 cells per group)
+  splits_file: splits/assignment.json
+  heldout_pairings: splits/heldout_pairings.json
+  renders_dir: renders          # renders/<split>/<group_id>/<key>.png
+  audit_dir: audit
+  release_dir: release
+  log_dir: logs
+
+food101:
+  source: local                 # "local" (official tarball, real image IDs) | "hf" (streaming;
+                                # IDs become hfval<index>, NOT official — local demo only)
+  split: test                   # [FIXED] test split only (manually cleaned labels)
+  hf_name: ethz/food101
+  hf_split: validation          # HF calls the official test split "validation"
+  parquet_files: []             # for source=parquet: local HF validation shards, in order from shard 0
+
+crops:
+  max_photos_per_class: 250     # photos tried per class (Food-101 test has 250/class)
+  target_min_per_class: 15      # class dropped below this many accepted cutouts
+  target_max_per_class: 20      # stop accepting once this many survive
+  detector_model: IDEA-Research/grounding-dino-base
+  detector_prompt: "plate of food."
+  box_threshold: 0.30
+  text_threshold: 0.25
+  segmenter_model: facebook/sam2.1-hiera-large
+  sam_mask_select: largest      # largest | best_iou, among SAM2's 3 multimask outputs with iou >= sam_min_iou
+  sam_min_iou: 0.70             # (single-mask output often returns a sub-part, e.g. one food item)
+  mask_area_frac: [0.15, 0.90]  # mask area / image area
+  min_dominant_cc_frac: 0.95    # largest component / total mask area
+  max_components_kept: 1        # small specks are dropped from the saved mask
+  box_pad_px: 4                 # padding around mask bbox when cropping the cutout
+  class_check:
+    model: openai/clip-vit-large-patch14   # NOT in the evaluation panel
+    prompt: "a photo of {}, a type of food."
+    canvas_gray: 128
+    canvas_size: 448
+    require_top1: true
+  qwen_check:                   # deliberate, logged exception to the selection-bias rule
+    model: Qwen/Qwen2.5-VL-3B-Instruct
+    min_class_accuracy: 0.80
+    n_options: 4
+    max_pixels: 401408          # 512*28*28
+    seed_offset: 17
+  device: auto                  # auto | cuda | mps | cpu
+  batch_size: 8
+
+backgrounds:
+  target_total: 1200
+  per_region_target: 75         # 16 regions x 75 = 1200
+  oversample: 1.6               # download this x target per region, to survive the audit
+  min_width: 900
+  min_height: 600
+  max_aspect: 2.2               # w/h (and h/w) above this rejected (panoramas)
+  thumb_width: 1280
+  request_sleep_s: 1.0
+  user_agent: "CIRA-dataset-builder/0.1 (academic course project; Wikimedia API client)"
+  category_depth: 2             # subcategory recursion depth
+  # License whitelist matched against extmetadata LicenseShortName (case-insensitive, prefix).
+  allowed_license_prefixes: ["cc0", "public domain", "pd", "cc by ", "cc by-sa ", "cc-by", "cc-by-sa"]
+  rejected_license_substrings: ["nc", "nd", "fair use", "non-free"]
+  # OPEN ITEM: Wikimedia categories per region. Proposal: everyday street/market/landscape
+  # scenes, not only landmarks, so the scene cue is realistic and varied.
+  categories:
+    japan:     ["Category:Streets in Tokyo", "Category:Streets in Kyoto", "Category:Shotengai", "Category:Temples in Kyoto"]
+    korea:     ["Category:Streets in Seoul", "Category:Markets in Seoul", "Category:Hanok"]
+    china:     ["Category:Streets in Beijing", "Category:Hutongs", "Category:Streets in Shanghai"]
+    vietnam:   ["Category:Streets in Hanoi", "Category:Hội An", "Category:Streets in Ho Chi Minh City"]
+    thailand:  ["Category:Streets in Bangkok", "Category:Markets in Thailand", "Category:Buddhist temples in Bangkok"]
+    india:     ["Category:Streets in Delhi", "Category:Streets in Jaipur", "Category:Markets in India"]
+    mexico:    ["Category:Streets in Mexico City", "Category:Streets in Oaxaca de Juárez", "Category:Guanajuato (city)"]
+    peru:      ["Category:Streets in Cusco", "Category:Streets in Lima", "Category:Machu Picchu"]
+    spain:     ["Category:Streets in Seville", "Category:Streets in Madrid", "Category:Streets in Barcelona"]
+    italy:     ["Category:Streets in Rome", "Category:Streets in Florence", "Category:Canals of Venice"]
+    france:    ["Category:Streets in Paris", "Category:Cafés in Paris", "Category:Streets in Lyon"]
+    greece:    ["Category:Streets in Athens", "Category:Santorini", "Category:Plaka"]
+    lebanon:   ["Category:Streets in Beirut", "Category:Byblos", "Category:Souks in Lebanon"]
+    usa:       ["Category:Streets in Manhattan", "Category:Streets in San Francisco", "Category:Diners in the United States"]
+    uk:        ["Category:Streets in London", "Category:Streets in Edinburgh", "Category:Pubs in London"]
+    canada:    ["Category:Streets in Montreal", "Category:Streets in Quebec City", "Category:Streets in Toronto"]
+  audit:
+    model: openai/clip-vit-large-patch14   # NOT in the evaluation panel
+    region_prompt: "a photo taken in {}."
+    region_topk_keep: 3         # keep if the labelled region is in CLIP top-k over all regions
+    attribute_prompts:
+      indoor: ["a photo of an indoor scene.", "a photo of an outdoor scene."]
+      water:  ["a photo with water, a river, a canal or the sea.", "a photo with no water in it."]
+    reject_prompts:             # reject if one of these beats "a photo of a street or a place"
+      - "a map."
+      - "a close-up photo of food."
+      - "a portrait photo of a person."
+      - "a diagram or a drawing."
+      - "an old black-and-white or sepia photograph."   # categories include historical photos
+    reject_reference_prompt: "a photo of a street or a place."
+    human_sample_per_region: 5
+
+render:                         # [FIXED] semantics; values are OPEN ITEM (propose + show render)
+  size: 448
+  bg_resample: lanczos
+  plate_resample: lanczos
+  slots:                        # footprint boxes [x0, y0, x1, y1), must not overlap
+    left:  [24, 240, 204, 420]
+    right: [244, 240, 424, 420]
+  feather_px: 3                 # inward alpha ramp width; alpha never extends past the hard mask
+  harmonize:
+    method: reinhard_rgb        # mean/std colour transfer toward the slot's background ring
+    strength: 0.5
+    ring_px: 24
+
+groups:                         # [FIXED] structure
+  keys: ["x", "t", "o", "b", "to", "tb", "ob"]
+  bg_dish_match_frac: 0.5       # fraction of groups whose base background matches one dish's region
+  max_tries_per_group: 2000
+  render_mode: paste
+
+questions:                      # [FIXED]
+  letters: "ABCD"
+  q_L: "What dish is on the left plate?"
+  q_R: "What dish is on the right plate?"
+  q_S: "In which country/region was this photo taken?"
+  answer_suffix: "Answer with the option's letter only."
+  unseen_distractor_pool: heldout   # heldout | all  (option pool for the unseen-class split)
+
+splits:                         # [FIXED] counts
+  group_counts: {train: 3000, val: 300, test_id: 1000, test_unseen: 400}
+  crop_fractions: {train: 0.60, val: 0.15, test_id: 0.25}       # per seen class
+  bg_fractions: {train: 0.55, val: 0.10, test_id: 0.20, test_unseen: 0.15}  # per region
+  phash_size: 8                 # 64-bit pHash
+  phash_max_hamming: 6          # <= this counts as a near-duplicate
+  heldout_class_region_pairs: 20
+  heldout_dish_swap_pairs: 20   # (from_class -> to_class) dish replacements withheld from train
+  heldout_region_swap_pairs: 10 # (from_region -> to_region) background swaps withheld from train
+
+controls:
+  identity_repaste: 100
+  wrong_entity_swap: 100
+  harmonized_groups: 100
+  blank_gray: 128
+  blank_groups: 100
+
+human_audit:
+  crops_per_class: 6
+  backgrounds_per_region: 5

@@ -1,0 +1,15 @@
+# Local laptop demo: small models, one HF parquet shard, pilot backgrounds. NOT for release.
+_base: config.yaml
+paths:
+  data_root: data_demo
+food101:
+  source: parquet
+  parquet_files: ["/Users/sharviendait/.cache/huggingface/hub/datasets--ethz--food101/snapshots/83488de741c1bd1ce27aa6a2b33e19c7bdf92ca9/data/validation-00000-of-00003.parquet"]
+crops:
+  detector_model: IDEA-Research/grounding-dino-tiny
+  segmenter_model: facebook/sam2.1-hiera-small
+  class_check: {model: openai/clip-vit-base-patch32}
+  target_min_per_class: 3
+  target_max_per_class: 6
+backgrounds:
+  audit: {model: openai/clip-vit-base-patch32}
